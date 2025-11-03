@@ -590,3 +590,86 @@ pub(super) fn swap_primary_slot(&mut self) {
 - **高性能**: 1PC+C 策略只需要一次 fsync，比传统 2PC 快约 2 倍
 - **安全性**: 通过校验和和事务 ID 检测和处理部分提交
 - **原子性**: 通过单字节切换保证事务的原子性
+
+# 保存点间数据流转详解
+
+在两个保存点之间，kv 数据从写入到落盘的流程以及不同模块中的状态流转如下：
+
+## 1. 核心概念回顾
+
+根据本文档，redb 使用 MVCC（多版本并发控制）实现事务隔离，所有写入都是顺序应用的。保存点和回滚在相同的 MVCC 结构上实现，创建保存点时会注册为读取事务以保留数据库快照，同时保存页面分配器状态的副本。
+
+## 2. 写入到落盘的完整流程
+
+### 写入阶段
+1. **数据写入**：用户通过 `WriteTransaction` 打开表并进行数据写入（插入、更新、删除），这些操作会修改 B-tree 结构。
+2. **页面分配**：在写入过程中，如果需要新页面，会通过 `TransactionalMemory::allocate()` 分配页面，这些页面被记录在 `allocated_since_commit` 集合中。
+3. **非持久化提交**：如果使用 `Durability::None`，调用 `non_durable_commit()`，数据更新到 secondary slot，但不调用 `fsync`，页面可能被放入 `unpersisted` 集合。
+4. **持久化提交**：如果使用 `Durability::Immediate`，调用 `durable_commit()`，执行以下步骤：
+   - 处理需要释放的页面，将它们从 `DATA_FREED_TABLE` 和 `SYSTEM_FREED_TABLE` 中移除并实际释放。
+   - 如果启用快速修复（quick-repair），会将分配器状态保存到 `ALLOCATOR_STATE_TABLE` 系统表中。
+   - 调用 `TransactionalMemory::commit()`，将数据和系统根更新写入 secondary slot。
+   - 如果启用两阶段提交（2PC），先调用 `fsync` 确保数据持久化，再更新主槽位并再次调用 `fsync`。
+   - 如果使用单阶段提交（1PC+C），更新 secondary slot 后直接切换主槽位并调用 `fsync`。
+
+### 落盘阶段
+1. **文件系统写入**：通过 `PagedCachedFile` 将页面数据写入文件系统缓存。
+2. **数据持久化**：调用 `fsync` 将文件系统缓存中的数据真正写入磁盘，确保数据持久化。
+
+## 3. 不同模块中的状态流转
+
+### WriteTransaction 模块
+- **初始状态**：`dirty` 标志为 false，没有打开的表。
+- **写入过程中**：打开表后 `dirty` 标志变为 true，表被记录在 `open_tables` 中。
+- **创建保存点**：调用 `ephemeral_savepoint()` 或 `persistent_savepoint()` 时，会检查 `dirty` 标志，如果为 true 则返回错误。保存点会记录当前的数据根（`user_root`）和事务 ID。
+- **提交过程中**：
+  - `commit_inner()`：根据 `durability` 设置调用 `non_durable_commit()` 或 `durable_commit()`。
+  - `durable_commit()`：
+    - 调用 `process_freed_pages()` 处理需要释放的页面。
+    - 如果启用快速修复，调用 `store_system_freed_pages()` 将系统表中释放的页面信息存储到 `SYSTEM_FREED_TABLE`。
+    - 调用 `TransactionalMemory::commit()` 执行实际的提交操作。
+    - 更新 `transaction_tracker` 中的非持久化提交状态。
+  - `non_durable_commit()`：
+    - 调用 `process_freed_pages_nondurable()` 处理未持久化的释放页面。
+    - 调用 `store_system_freed_pages()` 将系统表中释放的页面信息存储到 `SYSTEM_FREED_TABLE`。
+    - 调用 `TransactionalMemory::non_durable_commit()` 执行非持久化提交操作。
+    - 注册非持久化提交到 `transaction_tracker`。
+- **提交完成后**：清空 `allocated_since_commit` 和 `unpersisted` 集合，更新 `transaction_tracker` 中的保存点状态。
+
+### TransactionalMemory 模块
+- **页面分配**：`allocate()` 方法分配新页面，并将其添加到 `allocated_since_commit` 集合中。
+- **页面释放**：
+  - `free_if_uncommitted()`：如果页面在 `allocated_since_commit` 集合中，则将其释放并从集合中移除。
+  - `free_if_unpersisted()`：如果页面在 `unpersisted` 集合中，则将其释放并从集合中移除。
+- **提交过程中**：
+  - `commit_inner()`：
+    - 更新 secondary slot 的事务 ID、用户根和系统根。
+    - 如果启用两阶段提交，调用 `fsync`。
+    - 切换主槽位，更新 `two_phase_commit` 标志。
+    - 写入新头部并调用 `fsync`。
+    - 清空 `allocated_since_commit` 和 `unpersisted` 集合。
+  - `non_durable_commit()`：
+    - 更新 secondary slot 的事务 ID、用户根和系统根。
+    - 将 `allocated_since_commit` 中的页面转移到 `unpersisted` 集合中。
+    - 设置 `read_from_secondary` 标志为 true。
+- **提交完成后**：`allocated_since_commit` 和 `unpersisted` 集合为空，`read_from_secondary` 标志根据提交类型设置。
+
+### TransactionTracker 模块
+- **保存点管理**：
+  - `allocate_savepoint()`：分配新的保存点 ID，并将其与事务 ID 关联。
+  - `deallocate_savepoint()`：释放保存点 ID 及其关联的事务 ID。
+  - `is_valid_savepoint()`：检查保存点 ID 是否有效。
+  - `invalidate_savepoints_after()`：使指定保存点之后的所有保存点失效。
+- **非持久化提交管理**：
+  - `register_non_durable_commit()`：注册非持久化提交，记录其与上次持久化提交的关联。
+  - `clear_pending_non_durable_commits()`：清空待处理的非持久化提交。
+  - `is_unprocessed_non_durable_commit()`：检查非持久化提交是否已处理。
+  - `mark_unprocessed_non_durable_commit()`：标记非持久化提交为已处理。
+  - `oldest_unprocessed_non_durable_commit()`：获取最旧的未处理非持久化提交。
+
+### Savepoint 模块
+- **创建**：`new_ephemeral()` 创建临时保存点，记录当前事务 ID 和数据根。
+- **持久化**：`set_persistent()` 将临时保存点标记为持久化保存点。
+- **序列化**：`from_savepoint()` 将保存点序列化为字节数据，`to_savepoint()` 将字节数据反序列化为保存点对象。
+
+通过以上分析，我们可以看到在两个保存点之间，kv 数据从写入到落盘涉及多个模块的协同工作，每个模块都有明确的职责和状态流转过程，共同保证了数据的一致性和持久性。

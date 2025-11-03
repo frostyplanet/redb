@@ -521,3 +521,72 @@ redb 的设计即使在断电或在行为不佳的媒体上也是安全的。
     - 对应设计文档中的"Savepoints"部分
 
 所有结构都与设计文档中的描述一致，实现了文档中提到的核心功能，包括MVCC、B-tree存储结构、页面分配和回收机制、事务提交策略(1PC+C和2PC)、保存点和回滚功能以及数据库文件格式和布局。
+
+# primary_copy 机制详解
+
+在 redb 中，"primary_copy" 实际上是"primary slot"（主槽）的概念，它是 redb 数据库事务提交和恢复机制的核心部分。
+
+## 概念解释
+
+redb 使用双缓冲机制来管理事务提交，包含两个事务槽（transaction slots）：
+- **Slot 0**: 事务槽 0
+- **Slot 1**: 事务槽 1
+
+其中一个槽被标记为"primary"（主槽），代表当前有效的数据库状态。"primary_copy" 本质就是指这个当前活跃的事务槽。
+
+## 实现机制
+
+### 1. God Byte 标志位
+在数据库头部的 "god byte" 中，使用不同的位来控制：
+- **PRIMARY_BIT (0x01)**: 控制哪个槽是主槽
+- **TWO_PHASE_COMMIT (0x04)**: 指示是否使用 2PC 提交
+
+### 2. Swap 操作
+`swap_primary_slot()` 函数通过异或操作切换主槽：
+```rust
+pub(super) fn swap_primary_slot(&mut self) {
+    self.primary_slot ^= 1;  // 在 0 和 1 之间切换
+}
+```
+
+### 3. 两种提交策略
+
+#### 1PC+C (1-phase + checksum commit)
+- 默认的高性能提交策略
+- 只需要一次 fsync
+- 依赖校验和来检测部分提交
+- 流程：
+  1. 写入数据到 secondary slot
+  2. 写入头部信息
+  3. 翻转 primary bit（切换主槽）
+  4. 执行 fsync
+
+#### 2PC (2-phase commit)
+- 更安全但较慢的提交策略
+- 需要两次 fsync
+- 流程：
+  1. 写入数据到 secondary slot
+  2. 第一次 fsync（确保数据持久化）
+  3. 翻转 primary bit（切换主槽）
+  4. 第二次 fsync（确保头部更新持久化）
+
+## 代码实现位置
+
+- `src/tree_store/page_store/header.rs`: DatabaseHeader 结构和 primary_bit 定义
+  - `PRIMARY_BIT` 常量定义为 1
+  - `DatabaseHeader::swap_primary_slot()` 方法实现槽切换
+  - god byte 中的标志位管理
+
+- `src/tree_store/page_store/page_manager.rs`: 提交逻辑实现
+  - `TransactionalMemory::commit_inner()` 方法包含完整的提交流程
+  - 写入 secondary slot、翻转主槽、fsync 操作
+
+- `src/transactions.rs`: 事务控制接口
+  - `WriteTransaction::set_two_phase_commit()` 方法允许用户控制提交策略
+
+## 优势
+
+这种设计的优势包括：
+- **高性能**: 1PC+C 策略只需要一次 fsync，比传统 2PC 快约 2 倍
+- **安全性**: 通过校验和和事务 ID 检测和处理部分提交
+- **原子性**: 通过单字节切换保证事务的原子性

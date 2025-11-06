@@ -673,3 +673,245 @@ pub(super) fn swap_primary_slot(&mut self) {
 - **序列化**：`from_savepoint()` 将保存点序列化为字节数据，`to_savepoint()` 将字节数据反序列化为保存点对象。
 
 通过以上分析，我们可以看到在两个保存点之间，kv 数据从写入到落盘涉及多个模块的协同工作，每个模块都有明确的职责和状态流转过程，共同保证了数据的一致性和持久性。
+
+# AccessGuardMut::insert 函数详解
+
+`AccessGuardMut::insert`函数的逻辑如下：
+
+1. 首先获取要替换的值的字节表示：
+   ```rust
+   let value_bytes = V::as_bytes(value.borrow());
+   ```
+
+2. 获取当前条目的key（避免在后续操作中重复访问）：
+   ```rust
+   let key_bytes = {
+       let accessor = LeafAccessor::new(self.page.memory(), self.key_width, V::fixed_width());
+       accessor.key_unchecked(self.entry_index).to_vec()
+   };
+   ```
+
+3. 检查是否有足够的空间进行原地更新：
+   ```rust
+   if LeafMutator::sufficient_insert_inplace_space(
+       &self.page,
+       self.entry_index,
+       true,
+       self.key_width,
+       V::fixed_width(),
+       key_bytes.as_slice(),
+       value_bytes.as_ref(),
+   ) {
+       // 如果有足够空间，直接在原地更新
+       let mut mutator =
+           LeafMutator::new(self.page.memory_mut(), self.key_width, V::fixed_width());
+       mutator.insert(self.entry_index, true, &key_bytes, value_bytes.as_ref());
+   }
+   ```
+
+4. 如果没有足够空间进行原地更新，则需要创建新页面：
+   ```rust
+   else {
+       // 创建一个新的LeafBuilder来构建页面
+       let accessor = LeafAccessor::new(self.page.memory(), self.key_width, V::fixed_width());
+       let mut builder = LeafBuilder::new(
+           &self.mem,
+           &self.allocated,
+           accessor.num_pairs(),
+           self.key_width,
+           V::fixed_width(),
+       );
+
+       // 将所有条目复制到builder中，除了要更新的条目
+       for i in 0..accessor.num_pairs() {
+           if i == self.entry_index {
+               // 使用新值替换指定条目
+               builder.push(&key_bytes, value_bytes.as_ref());
+           } else {
+               // 复制其他条目
+               let entry = accessor.entry(i).unwrap();
+               builder.push(entry.key(), entry.value());
+           }
+       }
+
+       // 构建新页面
+       let new_page = builder.build()?;
+
+       // 更新父节点或根节点指向新页面
+       if let Some((ref mut parent_page, parent_entry_index)) = self.parent {
+           let mut mutator = BranchMutator::new(parent_page.memory_mut());
+           mutator.write_child_page(parent_entry_index, new_page.get_page_number(), DEFERRED);
+       } else {
+           self.root_ref.root = new_page.get_page_number();
+           self.root_ref.checksum = DEFERRED;
+       }
+
+       // 释放旧页面并更新当前页面引用
+       let old_page_number = self.page.get_page_number();
+       self.page = new_page;
+       let mut allocated = self.allocated.lock().unwrap();
+       assert!(
+           self.mem
+               .free_if_uncommitted(old_page_number, &mut allocated)
+       );
+   }
+   ```
+
+5. 最后更新页面引用和偏移量信息：
+   ```rust
+   // 更新页面引用到新页面并重新计算偏移量/长度
+   let new_accessor = LeafAccessor::new(self.page.memory(), self.key_width, V::fixed_width());
+   let (new_start, new_end) = new_accessor.value_range(self.entry_index).unwrap();
+
+   self.offset = new_start;
+   self.len = new_end - new_start;
+   ```
+
+总结来说，这个函数实现了在B-tree叶子节点中更新值的逻辑。它首先尝试原地更新以提高性能，如果空间不足则创建新页面并更新父节点引用。
+
+# B-tree 分裂与平衡机制
+
+在redb中，处理插入后分裂和平衡的情况主要在`MutateHelper::insert_helper`函数中实现。这个函数位于`src/tree_store/btree_mutator.rs`文件中。
+
+## 分裂处理逻辑
+
+### 1. 叶子节点分裂
+在叶子节点插入操作中，当节点大小超过页面大小时，会触发分裂：
+
+```rust
+if !builder.should_split() {
+    // 不需要分裂，正常构建页面
+    let new_page = builder.build()?;
+    // ...
+} else {
+    // 需要分裂叶子节点
+    let (new_page1, split_key, new_page2) = builder.build_split()?;
+    let split_key = split_key.to_vec();
+    // ...
+    InsertionResult {
+        new_root: new_page_number,
+        root_checksum: DEFERRED,
+        additional_sibling: Some((split_key, new_page_number2, DEFERRED)),
+        inserted_value: guard,
+        old_value: existing_value,
+    }
+}
+```
+
+### 2. 分支节点分裂
+当分支节点需要分裂时，处理逻辑类似：
+
+```rust
+let result = if builder.should_split() {
+    let (new_page1, split_key, new_page2) = builder.build_split()?;
+    InsertionResult {
+        new_root: new_page1.get_page_number(),
+        root_checksum: DEFERRED,
+        additional_sibling: Some((
+            split_key.to_vec(),
+            new_page2.get_page_number(),
+            DEFERRED,
+        )),
+        inserted_value: sub_result.inserted_value,
+        old_value: sub_result.old_value,
+    }
+} else {
+    let new_page = builder.build()?;
+    InsertionResult {
+        new_root: new_page.get_page_number(),
+        root_checksum: DEFERRED,
+        additional_sibling: None,
+        inserted_value: sub_result.inserted_value,
+        old_value: sub_result.old_value,
+    }
+};
+```
+
+### 3. 分裂判断条件
+分裂判断在`LeafBuilder::should_split`和`BranchBuilder::should_split`中实现：
+
+```rust
+pub(super) fn should_split(&self) -> bool {
+    let required_size = self.required_bytes(
+        self.pairs.len(),
+        self.total_key_bytes + self.total_value_bytes,
+    );
+    required_size > self.mem.get_page_size() && self.pairs.len() > 1
+}
+
+pub(super) fn should_split(&self) -> bool {
+    let size = RawBranchBuilder::required_bytes(
+        self.keys.len(),
+        self.total_key_bytes,
+        self.fixed_key_size,
+    );
+    size > self.mem.get_page_size() && self.keys.len() >= 3
+}
+```
+
+### 4. 分裂实现
+在`LeafBuilder::build_split`和`BranchBuilder::build_split`中实现具体的分裂逻辑，将节点分成两个部分，并返回中间的键作为分割键。
+
+## 平衡机制
+
+B-tree的平衡通过以下机制实现：
+
+1. **自底向上的分裂**：当叶子节点满了时，会分裂成两个叶子节点，并将中间键提升到父节点
+2. **递归分裂**：如果父节点也满了，会继续向上分裂，直到根节点，必要时会增加树的高度
+3. **分裂阈值**：redb使用页面大小的1/3作为合并阈值（合并时小于33%满），避免在分裂和合并之间振荡
+
+当插入操作导致节点大小超过页面大小时，就会触发分裂操作。分裂后会创建两个新节点，并将中间的键提升到父节点。如果父节点也满了，会递归地进行分裂操作，从而维持B-tree的平衡。
+
+# B-tree 中间节点键边界生成逻辑
+
+在redb中构建中间节点（分支节点）时，键的选择逻辑是使用子树中的实际键值，而不是通过字符序方法生成的边界键。
+
+在`BranchBuilder::build_split`方法中，当分裂一个分支节点时，它会选择一个中间的键作为分割点：
+
+```rust
+pub(super) fn build_split(self) -> Result<(PageMut, &'a [u8], PageMut)> {
+    let mut allocated_pages = self.allocated_pages.lock().unwrap();
+    assert_eq!(self.children.len(), self.keys.len() + 1);
+    assert!(self.keys.len() >= 3);
+    let division = self.keys.len() / 2;  // 分割点
+    let first_split_key_len: usize = self.keys.iter().take(division).map(|k| k.len()).sum();
+    let division_key = self.keys[division];  // 选择中间的键作为分割键
+    let second_split_key_len = self.total_key_bytes - first_split_key_len - division_key.len();
+
+    // 构建两个新的分支节点
+    // ...
+    Ok((page1, division_key, page2))
+}
+```
+
+在`LeafBuilder::build_split`方法中，当分裂叶子节点时，也是使用实际的键作为分割键：
+
+```rust
+pub(super) fn build_split(self) -> Result<(PageMut, &'a [u8], PageMut)> {
+    let total_size = self.total_key_bytes + self.total_value_bytes;
+    let mut division = 0;
+    let mut first_split_key_bytes = 0;
+    let mut first_split_value_bytes = 0;
+    for (key, value) in self.pairs.iter().take(self.pairs.len() - 1) {
+        first_split_key_bytes += key.len();
+        first_split_value_bytes += value.len();
+        division += 1;
+        if first_split_key_bytes + first_split_value_bytes >= total_size / 2 {
+            break;
+        }
+    }
+
+    // ...
+
+    Ok((page1, self.pairs[division - 1].0, page2))  // 使用实际的键作为分割键
+}
+```
+
+在redb的实现中，构建分支节点时选择的键是子节点中实际存在的键，通常是子节点中的最大键或最小键，而不是通过字符序方法生成的边界键。redb没有实现键压缩或最短唯一前缀等优化技术，而是直接使用完整的键值来确保简单性和正确性。
+
+构建分支节点时，redb会：
+1. 将子节点按键范围组织
+2. 使用子节点中的实际键作为分隔键
+3. 确保每个分隔键正确地划分了子节点的键范围
+
+这种设计保持了B-tree的简单性，虽然可能在中间节点中使用了更多的存储空间，但避免了键压缩可能带来的复杂性。redb没有采用字符序方法来缩短中间节点的键长度，而是直接使用完整的键值作为分隔键。
